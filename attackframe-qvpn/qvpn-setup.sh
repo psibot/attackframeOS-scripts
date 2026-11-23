@@ -27,22 +27,23 @@ die()   { printf '\e[31m[-]\e[0m %s\n' "$*" >&2; exit 1; }
 install_deps() {
     if command -v pacman >/dev/null; then
         c_inf "Arch-based system detected (pacman)"
-        $SUDO pacman -S --needed --noconfirm python tk openvpn curl tar
+        $SUDO pacman -S --needed --noconfirm python tk openvpn curl tar bind
     elif command -v apt-get >/dev/null; then
         c_inf "Debian/Ubuntu/Kali system detected (apt)"
         $SUDO apt-get update -qq
         $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            python3 python3-tk openvpn curl tar ca-certificates
+            python3 python3-tk openvpn curl tar ca-certificates dnsutils
     elif command -v dnf >/dev/null; then
         c_inf "Fedora/RHEL system detected (dnf)"
-        $SUDO dnf install -y python3 python3-tkinter openvpn curl tar
+        $SUDO dnf install -y python3 python3-tkinter openvpn curl tar bind-utils
     elif command -v zypper >/dev/null; then
         c_inf "openSUSE system detected (zypper)"
-        $SUDO zypper -n install python3 python3-tk openvpn curl tar
+        $SUDO zypper -n install python3 python3-tk openvpn curl tar bind-utils
     else
         die "Unsupported distro - install python3 + tkinter, openvpn, curl yourself."
     fi
     python3 -c 'import tkinter' 2>/dev/null || die "tkinter still missing after install"
+    command -v shodan >/dev/null || c_inf "Optional: 'pipx install shodan && shodan init <API key>' for the Shodan check"
     c_ok "Dependencies installed"
 }
 
@@ -157,6 +158,7 @@ Needs: python3 + tkinter, openvpn. Installed/updated by qvpn-setup.
 """
 
 import csv
+import datetime
 import io
 import json
 import os
@@ -199,7 +201,17 @@ class QVPN(tk.Tk):
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self):
-        top = ttk.Frame(self, padding=6)
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=4, pady=(4, 0))
+        srv = ttk.Frame(self.nb)
+        self.nb.add(srv, text="Servers")
+        ipt = ttk.Frame(self.nb)
+        self.nb.add(ipt, text="My IP")
+        self._build_ip_tab(ipt)
+        self._ip_loaded = False
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
+
+        top = ttk.Frame(srv, padding=6)
         top.pack(fill="x")
 
         ttk.Label(top, text="Country").pack(side="left")
@@ -225,7 +237,7 @@ class QVPN(tk.Tk):
         ttk.Button(top, text="List", command=self.refresh_list).pack(side="left", padx=6)
 
         # server table
-        mid = ttk.Frame(self, padding=(6, 0))
+        mid = ttk.Frame(srv, padding=(6, 0))
         mid.pack(fill="both", expand=True)
         cols = ("host", "country", "ip", "ping", "score")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
@@ -239,7 +251,7 @@ class QVPN(tk.Tk):
         self.tree.bind("<Double-1>", lambda e: self.connect())
 
         # action bar
-        act = ttk.Frame(self, padding=6)
+        act = ttk.Frame(srv, padding=6)
         act.pack(fill="x")
         self.reconnect = tk.BooleanVar(value=True)
         ttk.Checkbutton(act, text="Auto-reconnect", variable=self.reconnect).pack(side="left")
@@ -248,13 +260,13 @@ class QVPN(tk.Tk):
         ttk.Button(act, text="Disconnect", command=self.disconnect).pack(side="left", padx=4)
         ttk.Button(act, text="Status", command=self.check_status).pack(side="left", padx=4)
         ttk.Button(act, text="Logs", command=self.show_logs).pack(side="left", padx=4)
-        ttk.Button(act, text="My IP", command=self.show_ip).pack(side="left", padx=4)
+        ttk.Button(act, text="My IP", command=self.show_ip_tab).pack(side="left", padx=4)
         ttk.Button(act, text="Update vpngate", command=self.update_vpngate).pack(side="right")
 
         self.status = tk.StringVar(value="Status: unknown")
         ttk.Label(self, textvariable=self.status, padding=(6, 0), font=("TkDefaultFont", 10, "bold")).pack(fill="x")
 
-        self.out = tk.Text(self, height=7, wrap="word", state="disabled",
+        self.out = tk.Text(self, height=6, wrap="word", state="disabled",
                            bg="#111", fg="#9f9", insertbackground="#9f9")
         self.out.pack(fill="x", padx=6, pady=6)
 
@@ -380,7 +392,8 @@ class QVPN(tk.Tk):
                 self.ui(self.log, "connect timed out")
                 return
             self.ui(self.log, (r.stdout + r.stderr).strip() or "connect returned")
-            self.after(4000, self.check_status)
+            self.ui(self.after, 4000, self.check_status)
+            self.ui(self._maybe_recheck_ip)
 
         self._bg(work)
 
@@ -392,6 +405,7 @@ class QVPN(tk.Tk):
             r = self._sudo_vpngate(["disconnect"], timeout=30)
             self.ui(self.log, (r.stdout + r.stderr).strip() or "disconnected")
             self.ui(self.check_status)
+            self.ui(self._maybe_recheck_ip)
 
         self._bg(work)
 
@@ -439,19 +453,139 @@ class QVPN(tk.Tk):
         t.configure(state="disabled")
         t.pack(fill="both", expand=True)
 
-    def show_ip(self):
-        self.log("Checking public IP...")
+    # ------------------------------------------------------- My IP tab
+    def _build_ip_tab(self, parent):
+        bar = ttk.Frame(parent, padding=6)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Refresh", command=self.run_ip_checks).pack(side="left")
+        self.ip_auto = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Re-check after connect/disconnect",
+                        variable=self.ip_auto).pack(side="left", padx=8)
+        self.ip_stamp = tk.StringVar()
+        ttk.Label(bar, textvariable=self.ip_stamp).pack(side="right")
 
-        def work():
-            try:
-                with urllib.request.urlopen("https://ipinfo.io/json", timeout=10) as resp:
-                    d = json.load(resp)
-                msg = f"IP {d.get('ip')}  {d.get('city')}, {d.get('country')}  ({d.get('org')})"
-            except Exception as e:
-                msg = f"IP lookup failed: {e}"
-            self.ui(self.log, msg)
+        self.ipbox = tk.Text(parent, wrap="word", bg="#000", fg="#ddd",
+                             font=("Monospace", 10), state="disabled")
+        self.ipbox.pack(fill="both", expand=True, padx=6)
+        # same look as the terminal script: red-on-black tag + black-on-green title
+        self.ipbox.tag_configure("tag", foreground="#ff3b3b", background="#000",
+                                 font=("Monospace", 10, "bold"))
+        self.ipbox.tag_configure("title", foreground="#000", background="#5fff00",
+                                 font=("Monospace", 10, "bold"))
+        self.ipbox.tag_configure("dim", foreground="#888")
+        self.ipbox.tag_configure("warn", foreground="#ffb000")
 
-        self._bg(work)
+        ttk.Label(parent, text=" [!!] HACK THE PLANET !!   - Ps1B0t ",
+                  foreground="#5fff00", background="#000",
+                  font=("Monospace", 9, "bold")).pack(anchor="e", padx=6, pady=4)
+
+    def show_ip_tab(self):
+        self.nb.select(1)
+        self.run_ip_checks()
+
+    def _on_tab(self, _e=None):
+        if self.nb.index("current") == 1 and not self._ip_loaded:
+            self.run_ip_checks()
+
+    # (key, tag, title) - order matches the myp-ip script
+    IP_CHECKS = [
+        ("geo",   "[LOCATION:]",    "Current GEOLOCATION"),
+        ("ipinfo", "[XTERNAL IP:]", "IP Info"),
+        ("v4",    "[XTERNAL IP:]",  "IPv4"),
+        ("v6",    "[XTERNAL IP:]",  "IPv6"),
+        ("dig",   "[XTERNAL IP:]",  "DIG Info"),
+        ("shodan", "[XTERNAL IP:]", "Checking SHODAN"),
+    ]
+
+    def run_ip_checks(self):
+        self._ip_loaded = True
+        self._ip_results = {}
+        self.ip_stamp.set("checking...")
+        self._render_ip()
+        for key, _, _ in self.IP_CHECKS:
+            threading.Thread(target=self._ip_worker, args=(key,), daemon=True).start()
+
+    @staticmethod
+    def _http(url, timeout=10):
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode(errors="replace").strip()
+
+    @staticmethod
+    def _cmd(args, timeout=20):
+        if not shutil.which(args[0]):
+            return None
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout + r.stderr).strip()
+
+    def _ip_worker(self, key):
+        try:
+            if key == "geo":
+                raw = self._http("http://lumtest.com/myip.json")
+                try:
+                    res = json.dumps(json.loads(raw), indent=2)
+                except ValueError:
+                    res = raw
+            elif key == "ipinfo":
+                res = self._http("https://ipinfo.io/ip")
+            elif key == "v4":
+                res = self._http("https://ipv4.icanhazip.com")
+            elif key == "v6":
+                try:
+                    res = self._http("https://ipv6.icanhazip.com", timeout=6)
+                except Exception:
+                    res = ("unavailable", "dim")
+            elif key == "dig":
+                res = self._cmd(["dig", "+short", "myip.opendns.com", "@resolver1.opendns.com"])
+                if res is None:
+                    res = ("dig not installed (dnsutils / bind / bind-utils)", "dim")
+            elif key == "shodan":
+                res = self._cmd(["shodan", "myip"])
+                if res is None:
+                    res = ("shodan CLI not installed (pipx install shodan, then shodan init <API key>)", "dim")
+        except Exception as e:
+            res = (f"error: {e}", "warn")
+        self.ui(self._ip_done, key, res)
+
+    def _ip_done(self, key, res):
+        self._ip_results[key] = res
+        self._render_ip()
+        if len(self._ip_results) == len(self.IP_CHECKS):
+            self.ip_stamp.set("checked " + datetime.datetime.now().strftime("%H:%M:%S"))
+
+    def _ip_text(self, key):
+        r = self._ip_results.get(key)
+        if r is None:
+            return ("...", "dim")
+        return r if isinstance(r, tuple) else (r or "(empty)", None)
+
+    def _render_ip(self):
+        b = self.ipbox
+        b.configure(state="normal")
+        b.delete("1.0", "end")
+        for key, tag, title in self.IP_CHECKS:
+            b.insert("end", f" {tag} ", "tag")
+            b.insert("end", f" {title} ", "title")
+            b.insert("end", "\n\n")
+            text, style = self._ip_text(key)
+            b.insert("end", text + "\n\n", style or ())
+
+        # quick sanity notes for VPN use
+        v4 = self._ip_text("v4")[0]
+        dig = self._ip_text("dig")[0]
+        v6, v6style = self._ip_text("v6")
+        notes = []
+        if v6style is None and v6 not in ("...", "(empty)"):
+            notes.append("IPv6 is reachable - vpngate tunnels are IPv4 only, so IPv6 traffic may bypass the VPN.")
+        if v4[:1].isdigit() and dig[:1].isdigit() and v4 != dig:
+            notes.append(f"HTTP IPv4 ({v4}) and DNS-seen IP ({dig}) differ - check for a DNS/route leak.")
+        for n in notes:
+            b.insert("end", "[!] " + n + "\n", "warn")
+        b.configure(state="disabled")
+
+    def _maybe_recheck_ip(self):
+        if self.ip_auto.get() and self._ip_loaded:
+            self.after(3000, self.run_ip_checks)
 
     def update_vpngate(self):
         if not os.path.isfile(SETUP):

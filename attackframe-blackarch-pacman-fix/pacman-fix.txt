@@ -1,0 +1,14 @@
+Drop into blackarch and run the following
+sudo pacman -Sy nano
+sudo nano /etc/pacman.conf
+
+add
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+
+
+and
+
+DisableDownloadTimeout
+sudo pacman -Syu --disable-download-timeout

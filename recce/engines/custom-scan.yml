@@ -1,0 +1,20 @@
+name: custom-scan
+description: >
+  Direct vulnerability scan of the in-scope targets — NO subdomain enumeration
+  or asset scraping (no subdomains/bbot/reconftw/urls/fuzzing). It takes the
+  engagement's scope domains as-is, turns them into URLs (httprobe) and IPs
+  (resolve) just enough to feed the scanners, then runs nmap vulners, nuclei,
+  cvematch and the app scanners. The post-run CVE pass tiers every CVE finding.
+  Order is resolved by the DAG from consumes/produces.
+modules:
+  # minimal plumbing: probe the given targets (not subdomain discovery)
+  - { name: resolve,    enabled: true, consumes: [domain, subdomain], produces: [ip, subdomain] }
+  - { name: httprobe,   enabled: true, consumes: [domain, subdomain], produces: [url, tech] }
+  - { name: portscan,   enabled: true, consumes: [subdomain, ip],     produces: [port, ip] }
+  # the vulnerability scanners
+  - { name: nmap,       enabled: true, consumes: [ip, subdomain, port], produces: [port, service, finding] }
+  - { name: nuclei,     enabled: true, consumes: [url],               produces: [finding] }
+  - { name: cvematch,   enabled: true, consumes: [tech],              produces: [finding] }
+  - { name: waf,        enabled: true, consumes: [url],               produces: [waf] }
+  - { name: wpscan,     enabled: true, consumes: [tech],              produces: [finding] }
+  - { name: node2shell, enabled: true, consumes: [url],               produces: [finding] }

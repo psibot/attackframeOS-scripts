@@ -1,0 +1,59 @@
+# lanrecce: web console + scanner in one container.
+#
+#   cp .env.example .env        # set LANRECCE_TOKEN if you bind beyond localhost
+#   docker compose up -d --build
+#   open http://localhost:8088
+#
+# Why the container is set up this way:
+#   network_mode: host   the scanner must sit on your LAN. On Docker's bridge
+#                        network it would only see 172.x and couldn't ARP.
+#                        (Linux hosts only. Docker Desktop on macOS/Windows
+#                        runs in a VM and can't reach your LAN at layer 2.)
+#   NET_RAW/NET_ADMIN    ARP discovery, SYN scans, OS detection, UDP: what
+#                        `sudo` gives the native install, without --privileged.
+#   LANRECCE_CHOWN       results in ./runs are owned by you, not root.
+# With host networking there's no port mapping: the console listens directly on
+# LANRECCE_BIND:LANRECCE_PORT (127.0.0.1:8088 by default).
+
+services:
+  lanrecce:
+    build: .
+    image: lanrecce:latest
+    container_name: lanrecce
+    network_mode: host
+    cap_add: [NET_RAW, NET_ADMIN]
+    command: ["serve"]
+    environment:
+      LANRECCE_BIND: ${LANRECCE_BIND:-127.0.0.1}
+      LANRECCE_PORT: ${LANRECCE_PORT:-8088}
+      LANRECCE_TOKEN: ${LANRECCE_TOKEN:-}
+      LANRECCE_ALLOWED_HOSTS: ${LANRECCE_ALLOWED_HOSTS:-}
+      LANRECCE_ALLOW_PUBLIC: ${LANRECCE_ALLOW_PUBLIC:-0}
+      LANRECCE_DOSSIER_URL: ${LANRECCE_DOSSIER_URL:-http://localhost:8080}
+      LANRECCE_CHOWN: ${LANRECCE_UID:-1000}:${LANRECCE_GID:-1000}
+      LANRECCE_RUNS: /data/runs
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./runs:/data/runs
+      - lanrecce-cache:/root/.cache            # KEV / EPSS cache
+      - lanrecce-templates:/root/nuclei-templates
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,urllib.request;urllib.request.urlopen(f\"http://127.0.0.1:{os.environ.get('LANRECCE_PORT','8088')}/api/health\",timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # One-off: refresh nuclei templates in the shared volume.
+  #   docker compose run --rm update-templates
+  update-templates:
+    image: lanrecce:latest
+    profiles: [tools]
+    entrypoint: ["nuclei", "-update-templates"]
+    volumes:
+      - lanrecce-templates:/root/nuclei-templates
+
+volumes:
+  lanrecce-cache:
+  lanrecce-templates:
